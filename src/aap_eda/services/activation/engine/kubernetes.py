@@ -106,13 +106,13 @@ def get_project_data(id_activation):
         credential_data = credential_inputs.get_secret_value()
         data_loaded = yaml.safe_load(credential_data)
         ssh = False
-        ssh_key = data_loaded.ssh_key_data
+        ssh_key = data_loaded.get("ssh_key_data")
         if ssh_key != "":
             ssh = True
             password = ssh_key
         else:
-            password = data_loaded.password
-        username = data_loaded.username
+            password = data_loaded.get("password")
+        username = data_loaded.get("username")
         LOGGER.info("Successfull loaded scm data")
     except Exception as error:
         LOGGER.error(f"Error for load scm data "+str(error))
@@ -143,17 +143,18 @@ class Engine(ContainerEngine):
         self.pod_name = None
 
 
-    def create_secret_scm(self, auth_type, username, password, url):
+    def create_secret_scm(self, log_handler: LogHandler, auth_type, username, password, url):
 
+        self._delete_secret_git(log_handler)
         if auth_type == "ssh":
             data = {
-                "key": base64.b64encode(password)
+                "key": base64.b64encode(password.encode("utf-8")).decode("utf-8")
             }
         else:
             data = {
-                "username": base64.b64encode(username),
-                "password": base64.b64encode(password),
-                "url": base64.b64encode(url),
+                "username": base64.b64encode(username.encode("utf-8")).decode("utf-8"),
+                "password": base64.b64encode(password.encode("utf-8")).decode("utf-8"),
+                "url": base64.b64encode(url.encode("utf-8")).decode("utf-8"),
             }
 
         secret = k8sclient.V1Secret(
@@ -173,7 +174,6 @@ class Engine(ContainerEngine):
                 namespace=self.namespace,
                 body=secret,
             )
-
             LOGGER.info(f"Created secret: name: {self.resource_prefix}-secret-git-{self.activation_id}")
         except ApiException as e:
             LOGGER.error(f"API Exception {e}")
@@ -276,6 +276,7 @@ class Engine(ContainerEngine):
         # These three methods raise ContainerCleanupError
         # handled by the manager
         self._delete_secret(log_handler)
+        self._delete_secret_git(log_handler)
         self._delete_services(log_handler)
         self._delete_job(log_handler)
 
@@ -525,7 +526,10 @@ class Engine(ContainerEngine):
             )
         else:
             spec = k8sclient.V1PodSpec(
-                restart_policy="Never", containers=[container]
+                restart_policy="Never",
+                containers=[container],
+                init_containers=[init_container],
+                volumes=[git_clone_volume]
             )
 
         pod_template = k8sclient.V1PodTemplateSpec(
@@ -635,7 +639,7 @@ class Engine(ContainerEngine):
             else:
                 auth_type = "basic"
                 git_url = ScmRepository.build_url(git_url, username, password, "")
-            self.create_secret_scm(auth_type, username, password, git_url)
+            self.create_secret_scm(log_handler, auth_type, username, password, git_url)
             pod_template = self._create_pod_template_with_clone_spec(request, log_handler)
         else:
             pod_template = self._create_pod_template_spec(request, log_handler)
@@ -804,6 +808,7 @@ class Engine(ContainerEngine):
                 namespace=self.namespace,
                 field_selector=f"metadata.name={self.secret_name}",
             )
+            
             if not result.items:
                 return
 
@@ -820,6 +825,38 @@ class Engine(ContainerEngine):
             else:
                 message = (
                     f"Failed to delete secret {self.secret_name}: "
+                    f"status: {result.status}"
+                    f"reason: {result.reason}"
+                )
+                LOGGER.error(message)
+                log_handler.write(message, True)
+        except ApiException as e:
+            LOGGER.error(f"API Exception {e}")
+            raise ContainerCleanupError(str(e)) from e
+
+    def _delete_secret_git(self, log_handler: LogHandler) -> None:
+        try:
+            result = self.client.core_api.list_namespaced_secret(
+                namespace=self.namespace,
+                field_selector=f"metadata.name={self.resource_prefix}-secret-git-{self.activation_id}",
+            )
+
+            if not result.items:
+                return
+
+            result = self.client.core_api.delete_namespaced_secret(
+                name=f"{self.resource_prefix}-secret-git-{self.activation_id}",
+                namespace=self.namespace,
+            )
+
+            if result.status == "Success":
+                LOGGER.info(f"Secret {self.resource_prefix}-secret-git-{self.activation_id} is deleted")
+                log_handler.write(
+                    f"Secret {self.resource_prefix}-secret-git-{self.activation_id} is deleted.", True
+                )
+            else:
+                message = (
+                    f"Failed to delete secret {self.resource_prefix}-secret-git-{self.activation_id}: "
                     f"status: {result.status}"
                     f"reason: {result.reason}"
                 )
