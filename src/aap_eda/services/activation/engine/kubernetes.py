@@ -16,6 +16,7 @@
 import base64
 import json
 import logging
+import yaml
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -23,6 +24,12 @@ from dateutil import parser
 from kubernetes import client as k8sclient, config, watch
 from kubernetes.client.rest import ApiException
 from kubernetes.config.config_exception import ConfigException
+
+## Chris Hack
+from aap_eda.core.models.activation import Activation
+from aap_eda.core.models.project import Project
+from aap_eda.core.models.eda_credential import EdaCredential
+from aap_eda.services.project.scm import ScmRepository
 
 from aap_eda.core.enums import ActivationStatus
 from aap_eda.services.activation.engine.exceptions import (
@@ -78,6 +85,40 @@ def get_k8s_client() -> Client:
     except ConfigException as e:
         raise ContainerEngineInitError(str(e)) from e
 
+def get_project_data(id_activation):
+    """Chris Hack get data for pull repository"""
+
+    try:
+        activation_model = Activation
+        activation_data = activation_model.objects.get(id=id_activation).project
+        project_id = activation_data.id
+
+        project_model = Project
+        project_data = project_model.objects.get(id=project_id)
+        scm_type = project_data.scm_type
+        if scm_type != "git":
+            return False, False, None, None, None
+        git_url = project_data.url
+        credential_id = project_data.eda_credential_id
+
+        credential_model = EdaCredential
+        credential_inputs = credential_model.objects.get(id=credential_id).inputs
+        credential_data = credential_inputs.get_secret_value()
+        data_loaded = yaml.safe_load(credential_data)
+        ssh = False
+        ssh_key = data_loaded.ssh_key_data
+        if ssh_key != "":
+            ssh = True
+            password = ssh_key
+        else:
+            password = data_loaded.password
+        username = data_loaded.username
+        LOGGER.info("Successfull loaded scm data")
+    except Exception as error:
+        LOGGER.error(f"Error for load scm data "+str(error))
+        return False, False, None, None, None
+
+    return True, ssh, git_url, username, password
 
 class Engine(ContainerEngine):
     def __init__(
@@ -94,8 +135,49 @@ class Engine(ContainerEngine):
         self._set_namespace()
         self.resource_prefix = resource_prefix.replace("_", "-")
         self.secret_name = f"{self.resource_prefix}-secret-{activation_id}"
+
+        # Chris share id
+        self.activation_id = activation_id
+
         self.job_name = None
         self.pod_name = None
+
+
+    def create_secret_scm(self, auth_type, username, password, url):
+
+        if auth_type == "ssh":
+            data = {
+                "key": base64.b64encode(password)
+            }
+        else:
+            data = {
+                "username": base64.b64encode(username),
+                "password": base64.b64encode(password),
+                "url": base64.b64encode(url),
+            }
+
+        secret = k8sclient.V1Secret(
+            api_version="v1",
+            data=data,
+            kind="Secret",
+            metadata={
+                "name": f"{self.resource_prefix}-secret-git-{self.activation_id}",
+                "namespace": self.namespace,
+                "labels": {"aap": "eda"},
+            },
+            type="Opaque",
+        )
+
+        try:
+            self.client.core_api.create_namespaced_secret(
+                namespace=self.namespace,
+                body=secret,
+            )
+
+            LOGGER.info(f"Created secret: name: {self.resource_prefix}-secret-git-{self.activation_id}")
+        except ApiException as e:
+            LOGGER.error(f"API Exception {e}")
+            raise ContainerStartError(str(e)) from e
 
     def start(self, request: ContainerRequest, log_handler: LogHandler) -> str:
         # TODO : Should this be compatible with the previous version
@@ -314,6 +396,46 @@ class Engine(ContainerEngine):
 
         return container
 
+    def _create_container_with_clone_spec(
+        self,
+        request: ContainerRequest,
+        log_handler: LogHandler,
+    ) -> k8sclient.V1Container:
+        ports = []
+        if request.ports:
+            ports = [
+                k8sclient.V1ContainerPort(container_port=port)
+                for port in self._get_ports(request.ports)
+            ]
+        volume_mounts = [
+            k8sclient.V1VolumeMount(
+                name="git-clone-volume",
+                mount_path="/opt/source",
+            )
+        ]
+        container = k8sclient.V1Container(
+            image=request.image_url,
+            name=request.name,
+            image_pull_policy=request.pull_policy,
+            env=[k8sclient.V1EnvVar(name="ANSIBLE_LOCAL_TEMP", value="/tmp")],
+            args=request.cmdline.get_args(),
+            ports=ports,
+            command=[request.cmdline.command()],
+            volume_mounts=volume_mounts,
+        )
+
+        LOGGER.info(
+            f"Created container with clone: name: {container.name}, "
+            f"image: {container.image} "
+            f"args: {request.cmdline.get_args(sanitized=True)}"
+        )
+
+        log_handler.write(
+            f"Container args {request.cmdline.get_args(sanitized=True)}", True
+        )
+
+        return container
+
     def _create_pod_template_spec(
         self,
         request: ContainerRequest,
@@ -343,6 +465,78 @@ class Engine(ContainerEngine):
         )
 
         LOGGER.info(f"Created Pod template: {self.pod_name}")
+        return pod_template
+
+    def _create_pod_template_with_clone_spec(
+        self,
+        request: ContainerRequest,
+        log_handler: LogHandler,
+    ) -> k8sclient.V1PodTemplateSpec:
+        
+        init_container = k8sclient.V1Container(
+            name="git-clone",
+            image=request.image_url,
+            image_pull_policy="IfNotPresent",
+            args=[
+                "git",
+                "clone",
+                "--single-branch",
+                "-b",
+                "master",
+                "--",
+                "$(git_url)",
+                "/opt/source",
+            ],
+            env=[
+                k8sclient.V1EnvVar(
+                    name="git_url",
+                    value_from=k8sclient.V1EnvVarSource(
+                        secret_key_ref=k8sclient.V1SecretKeySelector(
+                            name=f"{self.resource_prefix}-secret-git-{self.activation_id}",
+                            key="url",
+                        )
+                    ),
+                )
+            ],
+            volume_mounts=[
+                k8sclient.V1VolumeMount(
+                    name="git-clone-volume",
+                    mount_path="/opt/source",
+                ),
+            ],
+        )
+
+        git_clone_volume = k8sclient.V1Volume(
+            name="git-clone-volume",
+            empty_dir=k8sclient.V1EmptyDirVolumeSource(),
+        )
+
+        container = self._create_container_with_clone_spec(request, log_handler)
+        if request.credential:
+            self._create_secret(request, log_handler)
+            spec = k8sclient.V1PodSpec(
+                restart_policy="Never",
+                containers=[container],
+                init_containers=[init_container],
+                volumes=[git_clone_volume],
+                image_pull_secrets=[
+                    k8sclient.V1LocalObjectReference(self.secret_name)
+                ],
+            )
+        else:
+            spec = k8sclient.V1PodSpec(
+                restart_policy="Never", containers=[container]
+            )
+
+        pod_template = k8sclient.V1PodTemplateSpec(
+            spec=spec,
+            metadata=k8sclient.V1ObjectMeta(
+                name=self.pod_name,
+                labels={"app": "eda", "job-name": self.job_name},
+            ),
+        )
+
+        LOGGER.info(f"Created Pod template clone : {self.pod_name}")
         return pod_template
 
     def _create_service(self, request: ContainerRequest) -> None:
@@ -432,7 +626,19 @@ class Engine(ContainerEngine):
         backoff_limit=0,
         ttl=KEEP_JOBS_FOR_SECONDS,
     ) -> k8sclient.V1Job:
-        pod_template = self._create_pod_template_spec(request, log_handler)
+        
+        # Chris Hack
+        ready, ssh, git_url, username, password = get_project_data(self.activation_id)
+        if ready:
+            if ssh:
+                auth_type = "ssh"
+            else:
+                auth_type = "basic"
+                git_url = ScmRepository.build_url(git_url, username, password, "")
+            self.create_secret_scm(auth_type, username, password, git_url)
+            pod_template = self._create_pod_template_with_clone_spec(request, log_handler)
+        else:
+            pod_template = self._create_pod_template_spec(request, log_handler)
 
         metadata = k8sclient.V1ObjectMeta(
             name=self.job_name,
