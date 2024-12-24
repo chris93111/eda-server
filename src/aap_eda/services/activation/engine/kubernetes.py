@@ -100,6 +100,10 @@ def get_project_data(id_activation):
             return False, False, None, None, None
         git_url = project_data.url
         credential_id = project_data.eda_credential_id
+        scm_branch = project_data.scm_branch
+        if scm_branch == "":
+            scm_branch = "master"
+        git_hash = project_data.git_hash
 
         credential_model = EdaCredential
         credential_inputs = credential_model.objects.get(id=credential_id).inputs
@@ -118,7 +122,7 @@ def get_project_data(id_activation):
         LOGGER.error(f"Error for load scm data "+str(error))
         return False, False, None, None, None
 
-    return True, ssh, git_url, username, password
+    return True, ssh, git_url, username, password, scm_branch, git_hash
 
 class Engine(ContainerEngine):
     def __init__(
@@ -143,7 +147,10 @@ class Engine(ContainerEngine):
         self.pod_name = None
 
 
-    def create_secret_scm(self, log_handler: LogHandler, auth_type, username, password, url):
+    def create_secret_scm(self, log_handler: LogHandler,
+                          auth_type, username, password, 
+                          url, scm_branch, git_hash):
+        """ Chris Hack secret auth"""
 
         self._delete_secret_git(log_handler)
         if auth_type == "ssh":
@@ -155,6 +162,8 @@ class Engine(ContainerEngine):
                 "username": base64.b64encode(username.encode("utf-8")).decode("utf-8"),
                 "password": base64.b64encode(password.encode("utf-8")).decode("utf-8"),
                 "url": base64.b64encode(url.encode("utf-8")).decode("utf-8"),
+                "scm_branch": base64.b64encode(scm_branch.encode("utf-8")).decode("utf-8"),
+                "git_hash": base64.b64encode(git_hash.encode("utf-8")).decode("utf-8"),
             }
 
         secret = k8sclient.V1Secret(
@@ -472,6 +481,7 @@ class Engine(ContainerEngine):
         self,
         request: ContainerRequest,
         log_handler: LogHandler,
+        scm_branch,
     ) -> k8sclient.V1PodTemplateSpec:
         
         init_container = k8sclient.V1Container(
@@ -483,7 +493,7 @@ class Engine(ContainerEngine):
                 "clone",
                 "--single-branch",
                 "-b",
-                "master",
+                scm_branch,
                 "--",
                 "$(git_url)",
                 "/opt/source",
@@ -632,15 +642,15 @@ class Engine(ContainerEngine):
     ) -> k8sclient.V1Job:
         
         # Chris Hack
-        ready, ssh, git_url, username, password = get_project_data(self.activation_id)
+        ready, ssh, git_url, username, password, scm_branch, git_hash = get_project_data(self.activation_id)
         if ready:
             if ssh:
                 auth_type = "ssh"
             else:
                 auth_type = "basic"
                 git_url = ScmRepository.build_url(git_url, username, password, "")
-            self.create_secret_scm(log_handler, auth_type, username, password, git_url)
-            pod_template = self._create_pod_template_with_clone_spec(request, log_handler)
+            self.create_secret_scm(log_handler, auth_type, username, password, git_url, scm_branch, git_hash)
+            pod_template = self._create_pod_template_with_clone_spec(request, log_handler, scm_branch, git_hash)
         else:
             pod_template = self._create_pod_template_spec(request, log_handler)
 
