@@ -482,6 +482,7 @@ class Engine(ContainerEngine):
         request: ContainerRequest,
         log_handler: LogHandler,
         scm_branch,
+        git_hash,
     ) -> k8sclient.V1PodTemplateSpec:
         
         init_container = k8sclient.V1Container(
@@ -489,14 +490,9 @@ class Engine(ContainerEngine):
             image=request.image_url,
             image_pull_policy="IfNotPresent",
             args=[
-                "git",
-                "clone",
-                "--single-branch",
-                "-b",
-                scm_branch,
-                "--",
-                "$(git_url)",
-                "/opt/source",
+                "sh",
+                "-c",
+                f"git clone --single-branch -b {scm_branch} -- \"$(git_url)\" /opt/source && cd /opt/source && git checkout {git_hash}",
             ],
             env=[
                 k8sclient.V1EnvVar(

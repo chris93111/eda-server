@@ -211,7 +211,10 @@ class AnsibleRulebookConsumer(AsyncWebsocketConsumer):
 
         created = event_data.get("created")
         if created:
-            created = datetime.strptime(created, "%Y-%m-%dT%H:%M:%S.%f")
+            if '+' in created or '-' in created[-6:]:
+                created = datetime.strptime(created, "%Y-%m-%dT%H:%M:%S.%f%z")
+            else:
+                created = datetime.strptime(created, "%Y-%m-%dT%H:%M:%S.%f")
 
         job_instance_event = models.JobInstanceEvent.objects.create(
             job_uuid=event_data.get("job_id"),
